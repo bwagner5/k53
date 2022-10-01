@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Resources used by K53
+Parameters:
+  ClusterName:
+    Type: String
+    Description: "EKS cluster name"
+Resources:
+  LambdaLinkControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "K53ControllerPolicy-${ClusterName}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - route53:CreateHostedZone
+              - route53:ChangeResourceRecordSets
+              - route53:ListHostedZonesByName
+              - route53:ListResourceRecordSets
+              - ec2:DescribeVpcs
+            Resource: "*"
