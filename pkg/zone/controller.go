@@ -3,6 +3,7 @@ package zone
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -11,69 +12,229 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	klog "k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 var phzName = "cluster-test.local."
 
 type Reconciler struct {
-	clientSet    kubernetes.Interface
-	corev1Client corev1.CoreV1Interface
-	r53          *route53.Route53
-	imds         *ec2metadata.EC2Metadata
-	sess         session.Session
-	phz          *route53.HostedZone
+	client client.Client
+	r53    *route53.Route53
+	imds   *ec2metadata.EC2Metadata
+	sess   session.Session
+	phz    *route53.HostedZone
 }
 
-func New(clientSet kubernetes.Interface, sess *session.Session) *Reconciler {
+func New(client client.Client, sess *session.Session) *Reconciler {
 	return &Reconciler{
-		clientSet:    clientSet,
-		corev1Client: clientSet.CoreV1(),
-		r53:          route53.New(sess),
-		imds:         ec2metadata.New(sess),
-		sess:         *sess,
+		client: client,
+		r53:    route53.New(sess),
+		imds:   ec2metadata.New(sess),
+		sess:   *sess,
 	}
 }
 
-func (d *Reconciler) InitPHZ(ctx context.Context) error {
+// SetupWithManager sets up the controller with the Manager.
+func (d *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("zone").
+		For(&v1.Pod{}).
+		Watches(&source.Kind{Type: &v1.Service{}}, &handler.EnqueueRequestForObject{}).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		Complete(d)
+}
+
+func (d *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	if err := d.CreatePrivateHostedZone(ctx); err != nil {
+		return ctrl.Result{}, fmt.Errorf("creating Route 53 private hosted zone: %w", err)
+	}
+
+	podRecords, err := d.GeneratePodARecords(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("generating pod A records, %w", err)
+	}
+	klog.V(10).Infof("Pod Records: %v", d.prettyPrintRecordSets(podRecords))
+
+	serviceRecords, err := d.GenerateServiceARecords(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("generating service A records, %w", err)
+	}
+	klog.V(10).Infof("Service Records: %v", d.prettyPrintRecordSets(serviceRecords))
+
+	existingRecords, err := d.ListResourceRecords(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing existing records from Route 53 private hosted zone, %w", err)
+	}
+	klog.V(5).Infof("Found %d existing records", len(existingRecords))
+
+	if err := d.UpsertRecords(ctx, podRecords, serviceRecords); err != nil {
+		return ctrl.Result{}, fmt.Errorf("upserting private hosted zone records, %w", err)
+	}
+
+	deletedRecords, err := d.DeleteOldRecords(ctx, existingRecords, podRecords, serviceRecords)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("delete old records from private hosted zone, %w", err)
+	}
+	if len(deletedRecords) > 0 {
+		klog.Infof("Deleted %d DNS resource record(s) that no longer exist in the cluster", len(deletedRecords))
+		klog.V(10).Infof("Deleted Records: %v", d.prettyPrintRecordSets(deletedRecords))
+	}
+
+	jitter := time.Duration(rand.Int63n(int64(2 * time.Minute)))
+	return ctrl.Result{RequeueAfter: (5 * time.Minute) + jitter}, nil
+}
+
+func (d *Reconciler) GeneratePodARecords(ctx context.Context) (map[string]*route53.ResourceRecordSet, error) {
+	dnsRecords := map[string]*route53.ResourceRecordSet{}
+	var podList v1.PodList
+	if err := d.client.List(ctx, &podList); err != nil {
+		return nil, fmt.Errorf("unable to fetch Pods: %w", err)
+	}
+	for _, pod := range podList.Items {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		podIP := pod.Status.PodIP
+		podIPHostname := strings.ReplaceAll(podIP, ".", "-")
+		key := fmt.Sprintf("%s.%s.pod.%s", podIPHostname, pod.Namespace, phzName)
+		dnsRecords[key] = &route53.ResourceRecordSet{
+			Name: &key,
+			Type: aws.String("A"),
+			TTL:  aws.Int64(60),
+			ResourceRecords: []*route53.ResourceRecord{
+				{
+					Value: aws.String(podIP),
+				},
+			},
+		}
+	}
+	return dnsRecords, nil
+}
+
+func (d *Reconciler) GenerateServiceARecords(ctx context.Context) (map[string]*route53.ResourceRecordSet, error) {
+	dnsRecords := map[string]*route53.ResourceRecordSet{}
+	var svcList v1.ServiceList
+	if err := d.client.List(ctx, &svcList); err != nil {
+		return nil, fmt.Errorf("unable to fetch Services: %w", err)
+	}
+	for _, svc := range svcList.Items {
+		clusterIP := svc.Spec.ClusterIP
+		key := fmt.Sprintf("%s.%s.svc.%s", svc.Name, svc.Namespace, phzName)
+		dnsRecords[key] = &route53.ResourceRecordSet{
+			Name: &key,
+			Type: aws.String("A"),
+			TTL:  aws.Int64(60),
+			ResourceRecords: []*route53.ResourceRecord{
+				{
+					Value: aws.String(clusterIP),
+				},
+			},
+		}
+	}
+	return dnsRecords, nil
+}
+
+func (d *Reconciler) UpsertRecords(ctx context.Context, recordSets ...map[string]*route53.ResourceRecordSet) error {
+	var changeSet []*route53.Change
+	for _, records := range recordSets {
+		for _, recordSet := range records {
+			rs := recordSet
+			changeSet = append(changeSet, &route53.Change{
+				Action:            aws.String(route53.ChangeActionUpsert),
+				ResourceRecordSet: rs,
+			})
+		}
+	}
+
+	if _, err := d.r53.ChangeResourceRecordSetsWithContext(ctx, &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: d.phz.Id,
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: changeSet,
+		},
+	}); err != nil {
+		return fmt.Errorf("unable to update private hosted zone %s with %d records: %w", *d.phz.Name, len(changeSet), err)
+	}
+	return nil
+}
+
+func (d *Reconciler) DeleteOldRecords(ctx context.Context, existingRecords map[string]*route53.ResourceRecordSet, recordMaps ...map[string]*route53.ResourceRecordSet) (map[string]*route53.ResourceRecordSet, error) {
+	recordsToDelete := existingRecords
+	for existingRecord := range existingRecords {
+		for _, recordSets := range recordMaps {
+			if _, ok := recordSets[existingRecord]; ok {
+				delete(recordsToDelete, existingRecord)
+				break
+			}
+		}
+	}
+
+	var deleteSet []*route53.Change
+	for _, recordSet := range recordsToDelete {
+		rs := recordSet
+		change := &route53.Change{
+			Action:            aws.String(route53.ChangeActionDelete),
+			ResourceRecordSet: rs,
+		}
+		deleteSet = append(deleteSet, change)
+	}
+	if len(deleteSet) > 0 {
+		if _, err := d.r53.ChangeResourceRecordSetsWithContext(ctx, &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: d.phz.Id,
+			ChangeBatch: &route53.ChangeBatch{
+				Changes: deleteSet,
+			},
+		}); err != nil {
+			return nil, fmt.Errorf("unable to delete resource record sets for hosted zone %s: %v", *d.phz.Name, err)
+		}
+	}
+	return recordsToDelete, nil
+}
+
+func (d *Reconciler) ListResourceRecords(ctx context.Context) (map[string]*route53.ResourceRecordSet, error) {
+	existingRecords := map[string]*route53.ResourceRecordSet{}
+	if err := d.r53.ListResourceRecordSetsPagesWithContext(ctx, &route53.ListResourceRecordSetsInput{
+		HostedZoneId: d.phz.Id,
+	}, func(lrrso *route53.ListResourceRecordSetsOutput, _ bool) bool {
+		for _, recordSet := range lrrso.ResourceRecordSets {
+			r := recordSet
+			if *r.Type == "A" || *r.Type == "AAAA" {
+				existingRecords[*r.Name] = r
+			}
+		}
+		return true
+	}); err != nil {
+		return nil, fmt.Errorf("unable to list resource record sets for hosted zone %s: %w", *d.phz.Name, err)
+	}
+	return existingRecords, nil
+}
+
+func (d *Reconciler) CreatePrivateHostedZone(ctx context.Context) error {
 	if d.phz != nil {
 		return nil
 	}
-	region := d.sess.Config.Region
-	macsResp, err := d.imds.GetMetadataWithContext(ctx, "/network/interfaces/macs")
+	vpcID, err := d.getVPCID(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to retrieve vpc-id from network interfaces: %v", err)
-	}
-	macs := strings.Split(macsResp, "\n")
-	if len(macs) == 0 {
-		return fmt.Errorf("unable to identify primary network interface: %v", err)
-	}
-	vpcID, err := d.imds.GetMetadataWithContext(ctx, fmt.Sprintf("/network/interfaces/macs/%s/vpc-id", macs[0]))
-	if err != nil {
-		return fmt.Errorf("unable to retrieve vpc-id from primary network interface: %v", err)
+		return fmt.Errorf("unable to get vpc id %w", err)
 	}
 	hzOut, err := d.r53.ListHostedZonesByNameWithContext(ctx, &route53.ListHostedZonesByNameInput{
 		DNSName: aws.String(phzName),
 	})
 	if err != nil {
-		klog.Errorf("unable to list route 53 hosted zones: %v", err)
+		return fmt.Errorf("unable to list route 53 hosted zones: %v", err)
 	}
 	if len(hzOut.HostedZones) > 0 && *hzOut.HostedZones[0].Name == phzName {
-		d.phz = &route53.HostedZone{
-			Id:   hzOut.HostedZones[0].Id,
-			Name: hzOut.HostedZones[0].Name,
-		}
+		d.phz = hzOut.HostedZones[0]
 		return nil
 	}
 	phzOutput, err := d.r53.CreateHostedZoneWithContext(ctx, &route53.CreateHostedZoneInput{
 		Name: aws.String(phzName),
 		VPC: &route53.VPC{
-			VPCRegion: region,
+			VPCRegion: d.sess.Config.Region,
 			VPCId:     aws.String(vpcID),
 		},
 		CallerReference: aws.String(fmt.Sprint(time.Now().UnixNano())),
@@ -88,109 +249,26 @@ func (d *Reconciler) InitPHZ(ctx context.Context) error {
 	return nil
 }
 
-func (d *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	if err := d.InitPHZ(ctx); err != nil {
-		klog.Errorf("creating r53 phz: %v", err)
-		return ctrl.Result{}, err
-	}
-	dnsRecords := map[string][]string{}
-
-	// Populate pod A Records
-	podList, err := d.corev1Client.Pods(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
+func (d *Reconciler) getVPCID(ctx context.Context) (string, error) {
+	macsResp, err := d.imds.GetMetadataWithContext(ctx, "/network/interfaces/macs")
 	if err != nil {
-		klog.Errorf("unable to fetch Pods: %v", err)
+		return "", fmt.Errorf("unable to retrieve vpc-id from network interfaces: %v", err)
 	}
-	for _, pod := range podList.Items {
-		if pod.Status.PodIP == "" {
-			continue
-		}
-		podIP := strings.ReplaceAll(pod.Status.PodIP, ".", "-")
-		dnsRecords[fmt.Sprintf("%s.%s.pod.%s", podIP, pod.Namespace, phzName)] = []string{pod.Status.PodIP}
+	macs := strings.Split(macsResp, "\n")
+	if len(macs) == 0 {
+		return "", fmt.Errorf("unable to identify primary network interface: %v", err)
 	}
-
-	//Populate Service Records
-	svcList, err := d.corev1Client.Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	vpcID, err := d.imds.GetMetadataWithContext(ctx, fmt.Sprintf("/network/interfaces/macs/%s/vpc-id", macs[0]))
 	if err != nil {
-		klog.Errorf("unable to fetch Services: %v", err)
+		return "", fmt.Errorf("unable to retrieve vpc-id from primary network interface: %v", err)
 	}
-	for _, svc := range svcList.Items {
-		key := fmt.Sprintf("%s.%s.svc.%s", svc.Name, svc.Namespace, phzName)
-		dnsRecords[key] = append(dnsRecords[key], svc.Spec.ClusterIP)
-	}
-
-	// Populate PHZ w/ DNS records
-	var changeSet []*route53.Change
-	for key, vals := range dnsRecords {
-		change := &route53.Change{
-			Action: aws.String(route53.ChangeActionUpsert),
-			ResourceRecordSet: &route53.ResourceRecordSet{
-				Name: aws.String(key),
-				Type: aws.String("A"),
-				TTL:  aws.Int64(60),
-			},
-		}
-		for _, val := range vals {
-			change.ResourceRecordSet.ResourceRecords = append(change.ResourceRecordSet.ResourceRecords,
-				&route53.ResourceRecord{Value: aws.String(val)})
-		}
-		changeSet = append(changeSet, change)
-	}
-	if _, err := d.r53.ChangeResourceRecordSetsWithContext(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: d.phz.Id,
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: changeSet,
-		},
-	}); err != nil {
-		klog.Errorf("unable to update private hosted zone %s with %d records: %v", *d.phz.Name, len(changeSet), err)
-		return ctrl.Result{}, err
-	}
-
-	// Delete old records
-	var recordsToDelete []string
-	if err := d.r53.ListResourceRecordSetsPagesWithContext(ctx, &route53.ListResourceRecordSetsInput{
-		HostedZoneId: d.phz.Id,
-	}, func(lrrso *route53.ListResourceRecordSetsOutput, _ bool) bool {
-		for _, record := range lrrso.ResourceRecordSets {
-			if _, ok := dnsRecords[*record.Name]; !ok {
-				recordsToDelete = append(recordsToDelete, *record.Name)
-			}
-		}
-		return true
-	}); err != nil {
-		klog.Errorf("unable to list resource record sets for hosted zone %s: %v", *d.phz.Name, err)
-		return ctrl.Result{}, err
-	}
-
-	var deleteSet []*route53.Change
-	for _, key := range recordsToDelete {
-		change := &route53.Change{
-			Action: aws.String(route53.ChangeActionDelete),
-			ResourceRecordSet: &route53.ResourceRecordSet{
-				Name: aws.String(key),
-				Type: aws.String("A"),
-			},
-		}
-		deleteSet = append(deleteSet, change)
-	}
-
-	if _, err := d.r53.ChangeResourceRecordSetsWithContext(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: d.phz.Id,
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: changeSet,
-		},
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("unable to delete resource record sets for hosted zone %s: %v", *d.phz.Name, err)
-	}
-	if len(deleteSet) > 0 {
-		klog.Infof("Deleted %d DNS resource records that no longer exist in the cluster", len(deleteSet))
-	}
-	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	return vpcID, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (d *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1.Pod{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
-		Complete(d)
+func (d *Reconciler) prettyPrintRecordSets(recordSets map[string]*route53.ResourceRecordSet) string {
+	var recordSetStrs []string
+	for _, rs := range recordSets {
+		recordSetStrs = append(recordSetStrs, fmt.Sprintf("%s -> %s", *rs.Name, *rs.ResourceRecords[0].Value))
+	}
+	return strings.Join(recordSetStrs, ", ")
 }

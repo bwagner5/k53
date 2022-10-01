@@ -24,7 +24,6 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 
-	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/klog/v2"
 
@@ -52,7 +51,6 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(srcv1.AddToScheme(scheme))
-	//+kubebuilder:scaffold:scheme
 }
 
 func main() {
@@ -73,8 +71,6 @@ func main() {
 	logger := klog.Background()
 	ctrl.SetLogger(logger)
 
-	controllerRuntimeConfig := ctrl.GetConfigOrDie()
-	clientSet := kubernetes.NewForConfigOrDie(controllerRuntimeConfig)
 	ctx := context.Background()
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -84,17 +80,6 @@ func main() {
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "997fc2.bwag.me",
 		BaseContext:            func() context.Context { return ctx },
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -109,12 +94,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := zone.New(clientSet, session.Create(ctx, version)).SetupWithManager(mgr); err != nil {
+	if err := zone.New(mgr.GetClient(), session.Create(ctx, version)).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Zone")
 		os.Exit(1)
 	}
-
-	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
