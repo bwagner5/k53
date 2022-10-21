@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net"
 	"strings"
 	"time"
 
@@ -99,18 +100,29 @@ func (d *Reconciler) GeneratePodARecords(ctx context.Context) (map[string]*route
 		if pod.Status.PodIP == "" {
 			continue
 		}
-		podIP := pod.Status.PodIP
-		podIPHostname := strings.ReplaceAll(podIP, ".", "-")
-		key := fmt.Sprintf("%s.%s.pod.%s", podIPHostname, pod.Namespace, phzName)
-		dnsRecords[key] = &route53.ResourceRecordSet{
-			Name: &key,
-			Type: aws.String("A"),
-			TTL:  aws.Int64(60),
-			ResourceRecords: []*route53.ResourceRecord{
-				{
-					Value: aws.String(podIP),
+		for _, podIP := range pod.Status.PodIPs {
+			ip := net.ParseIP(podIP.IP)
+			if ip == nil {
+				klog.Errorf("invalid IP address for pod %s/%s: %s", pod.Namespace, pod.Name, podIP.IP)
+				continue
+			}
+			recordType := "A"
+			if isIpv4 := ip.To4(); isIpv4 == nil {
+				recordType = "AAAA"
+			}
+
+			podIPHostname := strings.ReplaceAll(podIP.IP, ".", "-")
+			key := fmt.Sprintf("%s.%s.pod.%s", podIPHostname, pod.Namespace, phzName)
+			dnsRecords[key] = &route53.ResourceRecordSet{
+				Name: &key,
+				Type: aws.String(recordType),
+				TTL:  aws.Int64(60),
+				ResourceRecords: []*route53.ResourceRecord{
+					{
+						Value: aws.String(podIP.IP),
+					},
 				},
-			},
+			}
 		}
 	}
 	return dnsRecords, nil
