@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,9 +74,11 @@ func (d *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	klog.V(5).Infof("Found %d existing records", len(existingRecords))
 
-	if err := d.UpsertRecords(ctx, podRecords, serviceRecords); err != nil {
+	updated, err := d.UpsertRecords(ctx, existingRecords, podRecords, serviceRecords)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("upserting private hosted zone records, %w", err)
 	}
+	klog.V(5).Infof("Upserted %d records", updated)
 
 	deletedRecords, err := d.DeleteOldRecords(ctx, existingRecords, podRecords, serviceRecords)
 	if err != nil {
@@ -151,27 +154,52 @@ func (d *Reconciler) GenerateServiceARecords(ctx context.Context) (map[string]*r
 	return dnsRecords, nil
 }
 
-func (d *Reconciler) UpsertRecords(ctx context.Context, recordSets ...map[string]*route53.ResourceRecordSet) error {
+func (d *Reconciler) UpsertRecords(ctx context.Context, existingRecords map[string]*route53.ResourceRecordSet, recordSets ...map[string]*route53.ResourceRecordSet) (int, error) {
 	var changeSet []*route53.Change
 	for _, records := range recordSets {
 		for _, recordSet := range records {
 			rs := recordSet
+			if existingRecord, ok := existingRecords[*rs.Name]; ok && d.IsRecordSetEqual(existingRecord, rs) {
+				continue
+			}
 			changeSet = append(changeSet, &route53.Change{
 				Action:            aws.String(route53.ChangeActionUpsert),
 				ResourceRecordSet: rs,
 			})
 		}
 	}
-
+	if len(changeSet) == 0 {
+		return 0, nil
+	}
 	if _, err := d.r53.ChangeResourceRecordSetsWithContext(ctx, &route53.ChangeResourceRecordSetsInput{
 		HostedZoneId: d.phz.Id,
 		ChangeBatch: &route53.ChangeBatch{
 			Changes: changeSet,
 		},
 	}); err != nil {
-		return fmt.Errorf("unable to update private hosted zone %s with %d records: %w", *d.phz.Name, len(changeSet), err)
+		return 0, fmt.Errorf("unable to update private hosted zone %s with %d records: %w", *d.phz.Name, len(changeSet), err)
 	}
-	return nil
+	return len(changeSet), nil
+}
+
+func (d *Reconciler) IsRecordSetEqual(rsa *route53.ResourceRecordSet, rsb *route53.ResourceRecordSet) bool {
+	if *rsa.Type != *rsb.Type || *rsa.TTL != *rsb.TTL || len(rsa.ResourceRecords) != len(rsb.ResourceRecords) {
+		return false
+	}
+	ra := rsa.ResourceRecords
+	sort.Slice(ra, func(i, j int) bool {
+		return *ra[i].Value < *ra[j].Value
+	})
+	rb := rsb.ResourceRecords
+	sort.Slice(rb, func(i, j int) bool {
+		return *rb[i].Value < *rb[j].Value
+	})
+	for i, r := range ra {
+		if *r.Value != *rb[i].Value {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Reconciler) DeleteOldRecords(ctx context.Context, existingRecords map[string]*route53.ResourceRecordSet, recordMaps ...map[string]*route53.ResourceRecordSet) (map[string]*route53.ResourceRecordSet, error) {
